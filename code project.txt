@@ -1,0 +1,588 @@
+#################################################################
+# Project: The Evolution of Video Game Research
+# Purpose: Robust end-to-end pipeline for text analytics on abstracts
+# - loads CSV with column "Abstract"
+# - cleaning -> word cloud -> co-occurrence network -> sentiment -> LDA
+#################################################################
+
+#### SECTION 0: SETUP - INSTALL AND LOAD LIBRARIES ####
+packages <- c("tm", "wordcloud", "syuzhet", "topicmodels", "igraph",
+              "tidytext", "dplyr", "readr", "widyr", "ggraph",
+              "ggplot2", "tidyr", "purrr")
+
+new_packages <- packages[!(packages %in% installed.packages()[, "Package"])]
+if (length(new_packages)) install.packages(new_packages, dependencies = TRUE)
+invisible(lapply(packages, require, character.only = TRUE))
+
+cat("Setup complete. All packages are loaded.\n\n")
+
+#### SECTION 1: DATA LOADING FROM EXCEL FILE ####
+cat("Please select your Excel data file...\n")
+
+library(readxl)
+
+file_path <- file.choose()
+
+full_data <- read_excel(file_path, sheet = 1)
+
+cat("Column names detected:\n")
+print(names(full_data))
+
+# Auto-detect column containing 'Extracted'
+col_index <- grep("Extracted", names(full_data), ignore.case = TRUE)
+
+if (length(col_index) == 0) {
+  stop("No column with 'Extracted' found. Please check column names above.")
+}
+
+col_name <- names(full_data)[col_index[1]]
+cat("Using column:", col_name, "\n")
+
+# Extract text
+text_data <- as.character(full_data[[col_name]])
+
+# Clean encoding
+text_data <- iconv(text_data, from = "", to = "UTF-8", sub = "byte")
+text_data <- gsub("[^[:print:]\t]", " ", text_data)
+
+# Remove NA / empty
+text_data <- text_data[!is.na(text_data)]
+text_data <- text_data[nzchar(trimws(text_data))]
+
+if (length(text_data) == 0) {
+  stop("No valid text found after removing NA/empty rows.")
+}
+
+cat("Excel file loaded successfully -", length(text_data), "records found.\n\n")
+
+#################################################################
+# SECTION 2: TEXT CLEANING AND PRE-PROCESSING 
+#################################################################
+
+cat("Starting enhanced text cleaning...\n")
+
+library(dplyr)
+library(stringr)
+library(tidyverse)
+library(textstem)
+library(hunspell)
+library(textclean)
+
+# --- Step 1: convert to lowercase ---
+text_data <- str_to_lower(text_data, locale = "en")
+
+# --- Step 2: remove punctuation and digits ---
+text_data <- str_replace_all(text_data, "[,;:.]", " ")
+text_data <- str_replace_all(text_data, "[:digit:]", "")
+text_data <- str_replace_all(text_data, "[[:punct:]]", " ")
+text_data <- str_squish(text_data)
+
+# --- Step 3: Lemmatization using Hunspell dictionary ---
+# Convert to tibble for easy manipulation
+text_tbl <- tibble(comments = text_data)
+
+text_tbl$comments <- lemmatize_strings(text_tbl$comments, engine = "hunspell")
+
+# --- Step 4: Optional manual token replacements ---
+# Adjust this list as needed after inspecting your dataset
+text_tbl$comments <- replace_tokens(
+  text_tbl$comments,
+  tokens = c("ive", "notifications", "dont", "doesnt", "cant", "wont", "video", "games", "elsevier", "mindtree", "director", "program", "people", "board", "conduct", "million", "business", "initiative", "code", "not", "in", "found", "this", "report", "video", "games", "notification", "positive", "company", "level", "woman", "fy", "reduce", "mind", "human", "include", "ensure", "supplier"),
+  replacement = c("", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "" )
+)
+
+# --- Step 5: Re-create a tidy dataset with row IDs ---
+tidydata <- text_tbl %>%
+  mutate(id = row_number())
+
+cat("Basic text cleaning, lemmatization, and token correction complete.\n")
+
+# --- Step 6: Tokenization and stopword removal ---
+library(tidytext)
+data(stop_words)
+
+# Optional: add a custom list of research stopwords if available
+if (file.exists("stopwords.evaluation.csv")) {
+  stopwords_ev <- read_csv("stopwords.evaluation.csv")
+  stopwords_all <- stop_words %>% bind_rows(stopwords_ev)
+} else {
+  stopwords_all <- stop_words
+}
+
+word.tokens <- tidydata %>%
+  unnest_tokens(word, comments, to_lower = TRUE) %>%
+  anti_join(stopwords_all, by = "word") %>%
+  drop_na(word)
+
+# --- Step 7: Basic frequency check (quick sanity test) ---
+cat("Top words after cleaning:\n")
+print(head(count(word.tokens, word, sort = TRUE), 10))
+
+cat("Cleaning and tokenization complete.\n\n")
+
+#################################################################
+# SECTION 3: WORD CLOUD GENERATION (TIDYTEXT METHOD)
+#################################################################
+
+cat("Generating word frequency plots and word clouds...\n")
+
+library(ggplot2)
+library(wordcloud)
+library(wordcloud2)
+library(RColorBrewer)
+
+# --- Step 1: Frequency of each word ---
+word.freq1 <- word.tokens %>%
+  count(word, sort = TRUE) %>%
+  mutate(total = sum(n)) %>%
+  mutate(proportion = n / total)
+
+cat("Top words:\n")
+print(head(word.freq1, 10))
+
+# --- Step 2: Bar Plot (Top 20 Words) ---
+word.freq1 %>%
+  top_n(20) %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(x = n, y = word)) +
+  geom_col(fill = "steelblue") +
+  labs(
+    title = "Top 20 Most Frequent Words in Company Reports",
+    x = "Frequency",
+    y = NULL
+  ) +
+  theme_minimal()
+
+# --- Step 3: Word Cloud (Base R Wordcloud) ---
+set.seed(123546)
+word.freq1 %>%
+  with(
+    wordcloud(
+      word,
+      n,
+      max.words = 100,
+      scale = c(5, 0.3),
+      random.order = FALSE,
+      rot.per = 0.00,
+      colors = brewer.pal(8, "Dark2")
+    )
+  )
+
+# --- Step 4: Word Cloud 2 (Interactive / Web) ---
+word.cloud.data <- as.data.frame(word.freq1)
+names(word.cloud.data) <- c("words", "frequency")
+
+# Plot top 100 words for readability
+wordcloud2(word.cloud.data[1:100, ], size = 0.7, color = "random-dark")
+
+cat("Word cloud generation complete.\n\n")
+
+## ****************************************************************###
+###########  word network diagram   ######
+
+### pairwise association
+## The function pairwise_count in the R package widyr can be used to count how many       ## times a pair of appear together in a comment. It checks each comment to see if a specific ## pair of words is in it. Note that for two words, the different orders are considered as two ## pairs in the output.
+library(widyr)
+# pairwise count of words
+word.pairs <- word.tokens %>% pairwise_count(word, id, sort = TRUE)
+word.pairs
+## the phi coefficient measures the correlation for each pair of words
+word.phi <- word.tokens  %>% 
+     group_by(word)%>%
+     filter(n() >= 20)%>%
+     pairwise_cor(word, id, sort = TRUE)
+
+word.phi
+
+## visualization of pairwise correlation
+# arrow used in the network plot is defined through ‘a’
+library(igraph)
+library(ggraph)
+set.seed(124356)
+a <- arrow(angle = 30, length = unit(0.1, "inches"), ends = "last", type = "open")
+word.phi%>% 
+   filter(correlation > 0.20)%>%
+   graph_from_data_frame()%>% 
+  ggraph(layout = "fr") + 
+  geom_edge_link(aes(edge = correlation, width = correlation), edge_colour = "darkgray",  arrow = a) + 
+  geom_node_point(size = 5) + 
+  geom_node_text(aes(label = name), repel = TRUE, point.padding = unit(0.2, "lines")) 
+
+##### Cluster Analysis  ######
+##### DTM
+word.freq2 <- word.tokens %>% 
+  group_by(id) %>% 
+  count(word, sort = TRUE)
+
+## DTM
+word.dtm <- word.freq2 %>% cast_dtm(document= id, term = word, n)
+tm::inspect(word.dtm)
+##Remove sparse terms, i.e., terms occurring only in very few documents. This sparsity ##measure ranges from 0 to 1, with numbers closer to 1 meaning a term can be more sparse
+library(tm)
+word.sdtm <- removeSparseTerms(word.dtm, sparse=0.97)
+tm::inspect(word.sdtm)
+
+### hierarchical clustering
+word.sdtm.s <- scale(word.sdtm, scale=T)
+d <- proxy::dist(as.matrix(t(word.sdtm.s)), method = "cosine")
+set.seed(124356)
+hc <- hclust(d, method = "ward.D2")
+#display dendrogram
+plot(hc)
+#add rectangles around the branches of the dendrogram
+groups <- cutree(hc, k=4)
+rect.hclust(hc, k=4, border = "red")
+
+#################################################################
+# SECTION 5: SENTIMENT ANALYSIS (FIXED + FULL VISUALS)
+#################################################################
+
+cat("Starting sentiment analysis...\n")
+
+# Required packages
+library(tidytext)
+library(dplyr)
+library(ggplot2)
+library(textdata)
+library(reshape2)
+library(wordcloud)
+library(RColorBrewer)
+
+# --- Step 1: Verify token data ---
+# In your pipeline, 'word.tokens' is the tidy tokenized dataset (id, word)
+if (!exists("word.tokens")) stop("word.tokens not found. Run cleaning/tokenization section first.")
+
+cat("Total tokens available:", nrow(word.tokens), "\n")
+
+# --- Step 2: Bing Lexicon Analysis (Positive vs Negative Words) ---
+cat("Joining with Bing lexicon...\n")
+
+Feedback.match <- word.tokens %>%
+  inner_join(get_sentiments("bing"), by = "word") %>%
+  count(word, sentiment, sort = TRUE) %>%
+  acast(word ~ sentiment, value.var = "n", fill = 0)
+
+cat("Matched", nrow(Feedback.match), "words with Bing lexicon.\n")
+
+# --- Visual 1: Comparison Word Cloud (Positive vs Negative) ---
+cat("Generating comparison word cloud...\n")
+
+set.seed(123)
+comparison.cloud(
+  Feedback.match,
+  max.words = 100,
+  scale = c(4, 0.8),
+  random.order = FALSE,
+  rot.per = 0.25,
+  colors = brewer.pal(8, "Dark2")
+)
+
+# --- Step 3: Frequency Plot for Positive vs Negative Words ---
+Feedback.match.count <- word.tokens %>%
+  inner_join(get_sentiments("bing"), by = "word") %>%
+  count(word, sentiment, sort = TRUE) %>%
+  ungroup()
+
+cat("Creating sentiment frequency plot...\n")
+
+Feedback.match.count %>%
+  group_by(sentiment) %>%
+  slice_max(n, n = 15) %>%
+  ungroup() %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(x = n, y = word, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sentiment, scales = "free_y") +
+  labs(
+    title = "Most Common Positive and Negative Words",
+    x = "Frequency",
+    y = NULL
+  ) +
+  theme_minimal()
+
+# --- Step 4: Sentiment Score Distribution (AFINN Lexicon) ---
+cat("Calculating AFINN sentiment scores...\n")
+
+Feedback.sentiment <- word.tokens %>%
+  inner_join(get_sentiments("afinn"), by = "word")
+
+# Check a few results
+cat("Sample sentiment words:\n")
+print(head(Feedback.sentiment[, c("word", "value")], 10))
+
+# --- Step 5: Summary by Word ---
+Feedback.sentiment.summary <- Feedback.sentiment %>%
+  group_by(word) %>%
+  summarise(
+    occur
+
+cat("Starting final sentiment visualization...\n")
+
+# Load required packages
+library(tidytext)
+library(dplyr)
+library(ggplot2)
+library(textdata)
+library(wordcloud)
+library(RColorBrewer)
+
+# --- Step 0: Ensure token data exists ---
+if (!exists("word.tokens")) {
+  stop("word.tokens not found. Please run your text cleaning + tokenization section first.")
+}
+
+# --- Step 1: Compute sentiment summary if not already done ---
+if (!exists("Feedback.sentiment.summary")) {
+  cat("Sentiment summary not found — recomputing from tokens...\n")
+  
+  Feedback.sentiment <- word.tokens %>%
+    inner_join(get_sentiments("afinn"), by = "word")
+  
+  Feedback.sentiment.summary <- Feedback.sentiment %>%
+    group_by(word) %>%
+    summarise(
+      occurrence = n(),
+      contribution = sum(value),
+      Avg_score = mean(value)
+    ) %>%
+    ungroup() %>%
+    filter(occurrence >= 3)   # lowered threshold for smaller datasets
+}
+
+# --- Step 2: Check summary content ---
+n_words <- nrow(Feedback.sentiment.summary)
+cat("Sentiment summary has", n_words, "words.\n")
+
+if (n_words == 0) stop("No sentiment words found after filtering — check lexicons or text cleaning.")
+
+# --- Step 3: Top contributing words plot ---
+n_show <- ifelse(n_words < 30, n_words, 30)
+
+p1 <- Feedback.sentiment.summary %>%
+  slice_max(abs(contribution), n = n_show) %>%
+  mutate(word = reorder(word, contribution)) %>%
+  ggplot(aes(contribution, word, fill = contribution > 0)) +
+  geom_col(show.legend = FALSE) +
+  labs(
+    title = paste("Top", n_show, "Words Contributing to Overall Sentiment"),
+    subtitle = "Positive (green) vs Negative (red)",
+    x = "Sentiment Score × Frequency",
+    y = NULL
+  ) +
+  scale_fill_manual(values = c("red", "forestgreen")) +
+  theme_minimal()
+
+print(p1)
+
+# --- Step 4: Overall sentiment distribution ---
+cat("Creating overall sentiment distribution plot...\n")
+
+overall_summary <- word.tokens %>%
+  inner_join(get_sentiments("bing"), by = "word") %>%
+  count(sentiment)
+
+if (nrow(overall_summary) > 0) {
+  p2 <- ggplot(overall_summary, aes(x = sentiment, y = n, fill = sentiment)) +
+    geom_bar(stat = "identity", show.legend = FALSE) +
+    labs(
+      title = "Overall Sentiment Distribution (Positive vs Negative)",
+      x = NULL,
+      y = "Word Count"
+    ) +
+    scale_fill_manual(values = c("red", "forestgreen")) +
+    theme_minimal()
+  
+  print(p2)
+} else {
+  cat(" No words matched Bing lexicon for overview sentiment plot.\n")
+}
+
+cat("Final sentiment visuals completed successfully.\n")
+
+#################################################################
+# Topic Modeling block 
+#################################################################
+
+cat("Starting fixed topic modeling block (Student-Feedback style)...\n")
+
+# load libraries
+library(dplyr)
+library(tidytext)
+library(topicmodels)
+library(tm)
+library(slam)
+library(ggplot2)
+
+# --- Ensure token object exists and create Feedback.tokens alias for compatibility ---
+if (exists("word.tokens")) {
+  Feedback.tokens <- word.tokens
+  cat("Using word.tokens as Feedback.tokens (alias created).\n")
+} else if (exists("Feedback.tokens")) {
+  # already present
+  cat("Using existing Feedback.tokens.\n")
+} else {
+  stop("Neither word.tokens nor Feedback.tokens exists. Run the cleaning/tokenization section first.")
+}
+
+# Ensure id column exists and is integer-like (student code used id)
+if (!"id" %in% names(Feedback.tokens)) {
+  cat("No 'id' found in tokens — creating sequential ids per document.\n")
+  # If Feedback.tokens has a document identifier column under a different name, adapt here.
+  # Otherwise assume each original document was one row; create ids by grouping by document text if available.
+  Feedback.tokens <- Feedback.tokens %>% mutate(id = as.integer(row_number()))
+}
+
+# --- Create DTM ---
+cat("Creating Document-Term Matrix (DTM)...\n")
+Feedback.dtm <- tryCatch({
+  Feedback.tokens %>%
+    count(id, word) %>%
+    cast_dtm(document = id, term = word, value = n)
+}, error = function(e) {
+  stop("Failed to create DTM: ", e$message)
+})
+
+dtm_dim <- dim(Feedback.dtm)
+cat("DTM dimensions:", dtm_dim[1], "documents x", dtm_dim[2], "terms\n")
+
+if (dtm_dim[1] == 0 || dtm_dim[2] == 0) stop("DTM is empty. Check tokenization and stopword removal.")
+
+# Align rownames (document names) if needed
+rownames(Feedback.dtm) <- as.character(1:nrow(Feedback.dtm))
+
+# --- If vocabulary too large, trim: require min_doc_freq or keep top N terms ---
+n_docs <- dtm_dim[1]
+term_doc_counts <- slam::col_sums(Feedback.dtm > 0)
+min_doc_freq <- max(3, floor(0.002 * n_docs))  # at least in ~0.2% docs or 3 docs
+cand_terms <- names(term_doc_counts[term_doc_counts >= min_doc_freq])
+max_terms <- 3000
+
+if (length(cand_terms) > max_terms) {
+  keep_terms <- names(sort(term_doc_counts, decreasing = TRUE))[1:max_terms]
+  cat("Vocabulary large; keeping top", max_terms, "terms by document frequency.\n")
+} else if (length(cand_terms) < 50) {
+  keep_terms <- names(sort(term_doc_counts, decreasing = TRUE))[1:min(2000, length(term_doc_counts))]
+  cat("Too few candidate terms by freq; fallback to keeping top", length(keep_terms), "terms.\n")
+} else {
+  keep_terms <- cand_terms
+  cat("Keeping", length(keep_terms), "terms (doc freq >=", min_doc_freq, ").\n")
+}
+
+Feedback.dtm <- Feedback.dtm[, keep_terms, drop = FALSE]
+cat("Trimmed DTM dims:", dim(Feedback.dtm)[1], "docs x", dim(Feedback.dtm)[2], "terms\n")
+
+if (dim(Feedback.dtm)[2] < 10) stop("Too few terms left after trimming. Adjust trimming parameters.")
+
+# --- Prepare folds for 5-fold CV (use DTM rows) ---
+folding <- rep(1:5, length.out = nrow(Feedback.dtm))
+
+# --- Define runonce using VEM method so perplexity() works ---
+runonce <- function(k, fold) {
+  testing.idx <- which(folding == fold)
+  training.idx <- which(folding != fold)
+  training.dtm <- Feedback.dtm[training.idx, ]
+  testing.dtm  <- Feedback.dtm[testing.idx, ]
+  # Fit using VEM for compatibility with perplexity (faster than full cross-validated Gibbs)
+  train_model <- tryCatch({
+    LDA(training.dtm, k = k, method = "VEM", control = list(seed = 1234))
+  }, error = function(e) {
+    message("  LDA (VEM) failed on training for k=", k, ": ", e$message)
+    return(NULL)
+  })
+  if (is.null(train_model)) return(NA)
+  # compute perplexity on held-out test set - perplexity supports VEM objects
+  p <- tryCatch({
+    perplexity(train_model, newdata = testing.dtm)
+  }, error = function(e) {
+    message("  Perplexity calculation failed for k=", k, ": ", e$message)
+    return(NA)
+  })
+  return(p)
+}
+
+# --- Run 5-fold CV over k = 2:NT (keep NT moderate to save time) ---
+NT <- 8  # max topics to try (2..NT)
+Mat <- NULL
+cat("Running 5-fold CV for k = 2..", NT, " (this may take a while)...\n", sep = "")
+for (k in 2:NT) {
+  for (fold in 1:5) {
+    cat("Running k =", k, "fold =", fold, "...\n")
+    p <- runonce(k, fold)
+    Mat <- rbind(Mat, c(k, fold, p))
+  }
+}
+
+if (is.null(Mat)) stop("Cross-validation matrix is empty; CV failed entirely.")
+Mat <- as.data.frame(Mat)
+colnames(Mat) <- c("k", "fold", "perplexity")
+Mat$k <- as.integer(Mat$k)
+Mat$perplexity <- as.numeric(Mat$perplexity)
+
+# Compute mean perplexity per k (remove NA)
+mean.perp <- tapply(Mat$perplexity, Mat$k, FUN = function(x) mean(x, na.rm = TRUE))
+print(round(mean.perp, 2))
+
+# --- Plot perplexity vs k (only for valid ks) ---
+valid_k <- as.integer(names(mean.perp)[is.finite(mean.perp)])
+if (length(valid_k) > 0) {
+  plot(valid_k, mean.perp[as.character(valid_k)], type = "b",
+       xlab = "Number of topics", ylab = "Mean Perplexity (5-fold)", col = "steelblue",
+       main = "Perplexity vs Number of Topics")
+} else {
+  warning("No valid perplexity values computed; cannot plot perplexity.")
+}
+
+# --- Choose k: lowest mean perplexity among valid_k, fallback to 5 if none ---
+if (length(valid_k) == 0) {
+  selected_topics <- 5
+  cat("No valid perplexity; falling back to selected_topics =", selected_topics, "\n")
+} else {
+  selected_topics <- valid_k[which.min(mean.perp[as.character(valid_k)])]
+  cat("Selected number of topics by min mean perplexity:", selected_topics, "\n")
+}
+
+# --- Final LDA model: you can choose VEM or Gibbs. We'll fit Gibbs for final model for better mixing. ---
+cat("Fitting final LDA model (Gibbs) with k =", selected_topics, "...\n")
+final_control <- list(seed = 1234, iter = 1000, burnin = 200, thin = 100)
+Feedback.lda <- tryCatch({
+  LDA(Feedback.dtm, k = selected_topics, method = "Gibbs", control = final_control)
+}, error = function(e) {
+  stop("Final LDA fitting failed: ", e$message)
+})
+cat("Final LDA fit complete.\n")
+
+# --- Extract top terms per topic (beta) ---
+library(tidyr)
+library(tidytext)
+keyword.prob <- tidy(Feedback.lda, matrix = "beta") %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 6, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+print(keyword.prob)
+
+# --- Topic probabilities per document (gamma) ---
+topic.prob <- tidy(Feedback.lda, matrix = "gamma")
+head(topic.prob)
+
+# --- Export topic probabilities ---
+write.csv(as.data.frame(topic.prob), "Feedback07TopicProbabilityUnigram.csv", row.names = TRUE)
+cat("Exported topic probabilities to Feedback07TopicProbabilityUnigram.csv\n")
+
+# --- Optional: plot top terms per topic (feedback-style) ---
+if ("reorder_within" %in% ls("package:tidytext")) {
+  library(ggplot2)
+  plot_df <- keyword.prob %>% mutate(term = reorder_within(term, beta, topic))
+  ggplot(plot_df, aes(x = term, y = beta, fill = factor(topic))) +
+    geom_col(show.legend = FALSE) +
+    facet_wrap(~topic, scales = "free_y") +
+    coord_flip() +
+    scale_x_reordered() +
+    labs(title = "Top 6 Terms per Topic", x = NULL, y = "Beta (term probability)") +
+    theme_minimal()
+} else {
+  cat("tidytext helpers missing (reorder_within). Install/load tidytext to get the per-topic plot.\n")
+}
+
+cat("Topic modeling block finished successfully.\n")
